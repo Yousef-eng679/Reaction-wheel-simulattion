@@ -3,22 +3,20 @@
  *
  * Sensor noise robustness test — controller must converge despite realistic noise.
  *
- * Tests (PRD §6.7, Phase 6 deliverable):
+ * Tests (PRD §6.7, Phase 4 upgrade — was Phase 6 scaffold):
  *   With realistic sensor noise levels enabled (default sigma values), run the
- *   closed-loop system for a step-response scenario and assert:
- *     - The estimated angle converges to within a wider (but explicitly defined)
- *       tolerance band around the target — not perfect precision, but bounded error.
- *     - The system does NOT oscillate divergently.
+ *   closed-loop system for a 30° step-response scenario via runScenario() and assert:
  *
- * The tolerance band here is wider than the clean-physics test (Phase 3), since
- * sensor noise adds a realistic floor to achievable precision.
+ *   Test 1 — Convergence: the TRUE body angle (not the estimate) must be within
+ *     ±5° of the target during the final 10 s of a 60 s run. The wider tolerance
+ *     (vs Phase 3's ±2°) accounts for the noise floor and sensor lag.
  *
- * Phase 0: test structure scaffold only.
- *   - Imports are correct.
- *   - describe/it structure is in place.
- *   - Test bodies verify the stub throws 'not implemented'.
+ *   Test 2 — No divergent oscillation: the body angular velocity (ω₂) must remain
+ *     bounded during the final 10 s. If the controller is oscillating divergently
+ *     under noise, ω₂ will grow without bound; we assert it stays small.
  *
- * Phase 6 will implement the full noise robustness assertions using scenarioRunner.
+ * R3.2 — exercises real physics engine via SimulationLoop (inside runScenario).
+ * R3.3 — fixed sensor seed.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -95,16 +93,59 @@ const NOISE_ROBUSTNESS_SCENARIO: ScenarioConfig = {
 export { NOISY_CONVERGENCE_TOLERANCE_RAD };
 
 describe('Control — sensor noise robustness', () => {
-  it('converges to within 5° of target despite realistic sensor noise', () => {
-    // Phase 0 scaffold: throws 'not implemented' until Phase 6.
-    expect(() => {
-      runScenario(NOISE_ROBUSTNESS_SCENARIO);
-    }).toThrow('not implemented');
+  /**
+   * Test 1: Convergence with real noise.
+   * Evaluate the final 10 s of a 60 s run. Every snapshot in the last 10 s must
+   * have trueState.theta2 within ±5° of the target. This proves the system has
+   * genuinely settled (not just briefly crossed the target and drifted away).
+   */
+  it('true body angle stays within ±5° of target during final 10 s despite realistic sensor noise', () => {
+    const result = runScenario(NOISE_ROBUSTNESS_SCENARIO);
+    const { telemetry } = result;
+
+    // Examine only the final 10 s of the 60 s run
+    const evaluationWindowS = 10;
+    const finalWindowSnaps = telemetry.filter(
+      snap => snap.simTimeSec >= (NOISE_ROBUSTNESS_SCENARIO.durationSec - evaluationWindowS),
+    );
+
+    expect(finalWindowSnaps.length, 'No snapshots in final evaluation window').toBeGreaterThan(0);
+
+    for (const snap of finalWindowSnaps) {
+      expect(
+        Math.abs(snap.trueState.theta2 - NOISE_ROBUSTNESS_SCENARIO.setpointRad),
+        `True angle out of band at t=${snap.simTimeSec.toFixed(2)}s: ` +
+        `theta2=${(snap.trueState.theta2 * 180 / Math.PI).toFixed(2)}°`,
+      ).toBeLessThanOrEqual(NOISY_CONVERGENCE_TOLERANCE_RAD);
+    }
   });
 
-  it('does not exhibit divergent oscillation under realistic noise', () => {
-    expect(() => {
-      runScenario(NOISE_ROBUSTNESS_SCENARIO);
-    }).toThrow('not implemented');
+  /**
+   * Test 2: No divergent oscillation.
+   * Compute the RMS body angular velocity ω₂ over the final 10 s. If the controller
+   * is oscillating divergently under noise, ω₂ will be large. A settled system should
+   * have very small ω₂ — we bound it to < 0.1 rad/s.
+   */
+  it('body angular velocity stays small (< 0.1 rad/s RMS) in final 10 s — no divergent oscillation', () => {
+    const result = runScenario(NOISE_ROBUSTNESS_SCENARIO);
+    const { telemetry } = result;
+
+    const evaluationWindowS = 10;
+    const finalWindowSnaps = telemetry.filter(
+      snap => snap.simTimeSec >= (NOISE_ROBUSTNESS_SCENARIO.durationSec - evaluationWindowS),
+    );
+
+    expect(finalWindowSnaps.length).toBeGreaterThan(0);
+
+    const sumSqOmega2 = finalWindowSnaps.reduce(
+      (acc, snap) => acc + snap.trueState.omega2 ** 2,
+      0,
+    );
+    const rmsOmega2 = Math.sqrt(sumSqOmega2 / finalWindowSnaps.length);
+
+    expect(
+      rmsOmega2,
+      `RMS ω₂ = ${rmsOmega2.toFixed(4)} rad/s — system may be diverging under noise`,
+    ).toBeLessThan(0.1);
   });
 });
