@@ -1,5 +1,5 @@
 /**
- * src/ui/main.ts — Application entry point and RAF loop (Phase 5).
+ * src/ui/main.ts — Application entry point and RAF loop (Phase 5 + 6).
  *
  * Responsibilities:
  *   1. Build the DOM layout (header readouts, canvas, chart canvases, control panel).
@@ -37,6 +37,7 @@ import type { SimulationConfig } from '../sim/simulationLoop.ts';
 import { CanvasRenderer } from './canvasRenderer.ts';
 import { TelemetryChart, TelemetryLogger } from './telemetryChart.ts';
 import { ControlPanel } from './controlPanel.ts';
+import { exportTelemetryCSV, exportConfigJSON, importConfigJSON } from './exportImport.ts';
 import {
   DEFAULT_I1_WHEEL_KGM2,
   DEFAULT_I2_BODY_KGM2,
@@ -72,6 +73,11 @@ let logAccumulatorMs = 0;
 
 // Chart window: 10 seconds of data at 50 Hz = 500 samples
 const CHART_WINDOW = 500;
+
+// Telemetry snapshot buffer for CSV export (PRD §6.8)
+// Keeps the last MAX_EXPORT_SNAPSHOTS logged snapshots for on-demand CSV download.
+const MAX_EXPORT_SNAPSHOTS = 30_000; // ~10 min at 50 Hz
+const exportBuffer: ReturnType<typeof loop.getSnapshot>[] = [];
 
 // ---------------------------------------------------------------------------
 // Build default SimulationConfig from constants
@@ -138,6 +144,12 @@ appEl.innerHTML = `
     </div>
     <div class="toolbar">
       <button id="btn-kick-hdr" class="warn" title="Apply 0.5 N·m disturbance kick">💥 Kick</button>
+      <button id="btn-export-csv" title="Download telemetry as CSV">⬇ CSV</button>
+      <button id="btn-export-json" title="Download current config as JSON">⬇ Config</button>
+      <label id="btn-import-json" title="Import a config JSON to restore a scenario" style="cursor:pointer">
+        ⬆ Import
+        <input type="file" id="file-import-input" accept=".json" style="display:none" />
+      </label>
     </div>
   </div>
 
@@ -406,11 +418,14 @@ function rafLoop(nowMs: number): void {
   // 2. Read snapshot (single read per frame — consistent state)
   const snap = loop.getSnapshot();
 
-  // 3. Log to telemetry at ~50 Hz
+  // 3. Log to telemetry at ~50 Hz (charts) and append to export buffer
   logAccumulatorMs += realDtMs;
   if (logAccumulatorMs >= LOG_EVERY_MS) {
     logAccumulatorMs = 0;
     logger.log(snap);
+    // Maintain a rolling export buffer (drop oldest when full)
+    if (exportBuffer.length >= MAX_EXPORT_SNAPSHOTS) exportBuffer.shift();
+    exportBuffer.push({ ...snap, trueState: { ...snap.trueState }, sensorReading: { ...snap.sensorReading } });
   }
 
   // 4. Update header readouts
@@ -443,3 +458,57 @@ function rafLoop(nowMs: number): void {
 
 // Kick off RAF loop
 requestAnimationFrame(rafLoop);
+
+// ---------------------------------------------------------------------------
+// Export / Import button wiring (Phase 6 — PRD §6.8)
+// ---------------------------------------------------------------------------
+
+document.getElementById('btn-export-csv')!.addEventListener('click', () => {
+  if (exportBuffer.length === 0) {
+    alert('No telemetry data yet. Let the simulation run for a moment first.');
+    return;
+  }
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  exportTelemetryCSV(exportBuffer, `reaction_wheel_telemetry_${ts}.csv`);
+});
+
+document.getElementById('btn-export-json')!.addEventListener('click', () => {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  exportConfigJSON(simConfig, `reaction_wheel_config_${ts}.json`);
+});
+
+document.getElementById('file-import-input')!.addEventListener('change', async (evt) => {
+  const input = evt.target as HTMLInputElement;
+  const file  = input.files?.[0];
+  if (!file) return;
+  try {
+    const importedConfig = await importConfigJSON(file);
+    // Apply the imported config: update liveParams to match, then rebuild loop
+    liveParams.i1           = importedConfig.physicsParams.I1;
+    liveParams.i2           = importedConfig.physicsParams.I2;
+    liveParams.friction1    = importedConfig.physicsParams.frictionCoeff1;
+    liveParams.friction2    = importedConfig.physicsParams.frictionCoeff2;
+    liveParams.maxRpm       = importedConfig.motorParams.maxRPM;
+    liveParams.maxTorqueNm  = importedConfig.motorParams.maxTorqueNm;
+    liveParams.motorTauS    = importedConfig.motorParams.timeConstantS;
+    liveParams.gyroNoiseSigma       = importedConfig.sensorParams.gyroNoiseSigma;
+    liveParams.accelAngleNoiseSigma = importedConfig.sensorParams.accelAngleNoiseSigma;
+    liveParams.alpha        = importedConfig.estimatorParams.alpha;
+    liveParams.kp           = importedConfig.pidParams.kp;
+    liveParams.ki           = importedConfig.pidParams.ki;
+    liveParams.kd           = importedConfig.pidParams.kd;
+    liveParams.setpointRad  = importedConfig.initialSetpoint ?? 0;
+    // Rebuild using the exact imported config (preserves sensor seed for reproducibility)
+    simConfig = importedConfig;
+    loop = new SimulationLoop(simConfig);
+    loop.setSetpoint(liveParams.setpointRad);
+    logger.clearAll();
+    exportBuffer.length = 0;
+    lastFrameTimeMs = null;
+    console.info('[Import] Config loaded successfully:', file.name);
+  } catch (err) {
+    alert(`Import failed: ${(err as Error).message}`);
+  }
+  // Reset file input so the same file can be re-imported
+  input.value = '';
+});
