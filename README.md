@@ -126,5 +126,3 @@ The `.roles` file in this directory is the standing constraint document for all 
 - **No backend** — fully client-side static app
 
 ---
-
-*See `PRD.md` and `IMPLEMENTATION_PLAN.md` in the repository root for full requirements and phase-by-phase execution plan.*
