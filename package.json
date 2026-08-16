@@ -12,9 +12,13 @@
     "test:ui": "vitest --ui"
   },
   "devDependencies": {
+    "@types/three": "^0.185.4",
     "@vitest/ui": "^3.2.4",
     "typescript": "~6.0.2",
     "vite": "^8.2.0",
     "vitest": "^3.2.4"
+  },
+  "dependencies": {
+    "three": "^0.185.1"
   }
 }
