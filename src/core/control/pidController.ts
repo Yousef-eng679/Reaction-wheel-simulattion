@@ -21,7 +21,7 @@ export interface PidParams {
   kp: number;
   /** Integral gain [N·m/(rad·s)]. */
   ki: number;
-  /** Derivative gain [N·m·s/rad]. Applied to measurement, not error. */
+  /** Derivative gain [N·m·s/rad]. Applied to measurement, not error, to avoid kick. */
   kd: number;
   /** Minimum controller output [N·m]. Used for output clamping and windup protection. */
   outputMin: number;
@@ -33,12 +33,21 @@ export interface PidParams {
  * PidController — standard PID with correct real-world features.
  *
  * Features implemented:
- *   1. Integral windup protection via back-calculation: integral accumulation halts
- *      when the output is saturated.
+ *   1. Integral windup protection via conditional integration:
+ *      the integral accumulates only when the output is not saturated, OR when
+ *      integrating would drive the output back toward the linear region (i.e. error
+ *      and saturation direction are opposite). This prevents unlimited wind-up while
+ *      still allowing the integral to work the system out of saturation when the
+ *      error reverses.
  *   2. Derivative-on-measurement: derivative is computed from the estimated angle
- *      signal (not error), preventing derivative kick on setpoint step changes.
+ *      signal (not from error), so a setpoint step change does not produce a
+ *      derivative spike (kick). Sign: d/dt(error) = -d/dt(measurement) for
+ *      constant setpoint, so dTerm = -kd × (dMeasurement/dt).
  *   3. Output clamping: output is strictly clamped to [outputMin, outputMax].
- *   4. Live gain changes supported via setGains().
+ *   4. Live gain changes supported via setGains() — applied on the next update().
+ *
+ * Portability note: the update() logic translates to embedded C++ almost line-for-line.
+ * All state is primitive scalars; no dynamic allocation, no closures, no JS-specifics.
  */
 export class PidController {
   private params: PidParams;
@@ -47,6 +56,13 @@ export class PidController {
   private integralTerm: number = 0;
   private lastMeasurement: number = 0;
   private hasLastMeasurement: boolean = false;
+
+  /**
+   * The final pre-clamp output from the last update() call [N·m].
+   * Exposed via getLastRawOutput() for telemetry (saturation visualization in Phase 5).
+   * Stored AFTER windup protection and integral recalculation, so it accurately
+   * represents the controller's intention before the actuator limit is applied.
+   */
   private lastRawOutput: number = 0;
 
   constructor(params: PidParams) {
@@ -56,20 +72,43 @@ export class PidController {
   /**
    * Computes PID output for one control step.
    *
+   * Algorithm (step by step, portable to C++):
+   *   1. error = setpoint − measurement
+   *   2. pTerm = kp × error
+   *   3. dMeasurement = (measurement − lastMeasurement) / dt   [first step = 0]
+   *      dTerm = −kd × dMeasurement                           [sign: see class doc]
+   *   4. Tentative integral = integralTerm + ki × error × dt
+   *   5. Determine whether to apply the tentative integral (conditional integration):
+   *        - rawOutput_tentative = pTerm + tentativeIntegral + dTerm
+   *        - isSaturatedHigh = rawOutput_tentative > outputMax
+   *        - isSaturatedLow  = rawOutput_tentative < outputMin
+   *        - Block integration if (saturatedHigh AND error > 0) — integrating further
+   *          pushes deeper into positive saturation.
+   *        - Block integration if (saturatedLow AND error < 0) — same logic, negative.
+   *        - Otherwise allow: also allows integration when saturated but error has
+   *          reversed (helping unsaturate).
+   *   6. Compute finalRawOutput = pTerm + (protected)integralTerm + dTerm
+   *   7. Store finalRawOutput as lastRawOutput (for telemetry)
+   *   8. Clamp to [outputMin, outputMax] and return.
+   *
    * @param setpoint     Target body angle [rad].
-   * @param measurement  Estimated body angle from the sensor/estimator [rad]. (Never ground truth!)
+   * @param measurement  Estimated body angle from the sensor/estimator [rad].
+   *                     MUST be estimator output — never ground truth (R2.1).
    * @param dt           Elapsed time since last update [s].
    * @returns            Control output [N·m], clamped to [outputMin, outputMax].
    */
   update(setpoint: number, measurement: number, dt: number): number {
     if (dt <= 0) return 0; // Guard against zero/negative dt
 
+    const { kp, ki, kd, outputMin, outputMax } = this.params;
+
+    // Step 1: error
     const error = setpoint - measurement;
 
-    // Proportional term
-    const pTerm = this.params.kp * error;
+    // Step 2: proportional term
+    const pTerm = kp * error;
 
-    // Derivative on measurement (to avoid derivative kick)
+    // Step 3: derivative-on-measurement (zero on first call — no kick at startup)
     let dMeasurement = 0;
     if (this.hasLastMeasurement) {
       dMeasurement = (measurement - this.lastMeasurement) / dt;
@@ -77,60 +116,43 @@ export class PidController {
       this.hasLastMeasurement = true;
     }
     this.lastMeasurement = measurement;
+    // dError/dt = −dMeasurement/dt for constant setpoint → dTerm = −kd × dMeasurement
+    const dTerm = -kd * dMeasurement;
 
-    // Note: dMeasurement replaces dError. The standard dError/dt is d(setpoint - measurement)/dt.
-    // Assuming setpoint is constant, dError/dt = -dMeasurement/dt.
-    // So the D term is -kd * dMeasurement.
-    const dTerm = -this.params.kd * dMeasurement;
+    // Step 4: tentative integral (not yet guarded)
+    const tentativeIntegral = this.integralTerm + ki * error * dt;
 
-    // Calculate integral term (tentative)
-    // We add to the integral term here, but we will back-calculate if saturated.
-    const iTermUnbounded = this.integralTerm + (this.params.ki * error * dt);
+    // Step 5: conditional integration — windup protection
+    // Compute the tentative raw output to detect saturation direction.
+    const rawTentative = pTerm + tentativeIntegral + dTerm;
+    const isSaturatedHigh = rawTentative > outputMax;
+    const isSaturatedLow  = rawTentative < outputMin;
+    // Block integral update only when it would push deeper into saturation.
+    // Allow update if: not saturated at all, OR error is pulling OUT of saturation.
+    const blockIntegral =
+      (isSaturatedHigh && error > 0) ||
+      (isSaturatedLow  && error < 0);
 
-    // Raw unbounded output
-    const rawOutput = pTerm + iTermUnbounded + dTerm;
-    this.lastRawOutput = rawOutput;
-
-    // Clamped output
-    let clampedOutput = rawOutput;
-    if (clampedOutput > this.params.outputMax) {
-      clampedOutput = this.params.outputMax;
-    } else if (clampedOutput < this.params.outputMin) {
-      clampedOutput = this.params.outputMin;
+    if (!blockIntegral) {
+      this.integralTerm = tentativeIntegral;
     }
+    // else: hold integralTerm unchanged (do not wind up)
 
-    // Integral windup protection (back-calculation)
-    // If saturated, we adjust the integral term so that the raw output equals the clamped output.
-    // This provides a smooth exit from saturation.
-    // i_new = clamped_output - p_term - d_term
-    // Wait, standard back-calculation / clamping logic:
-    if (rawOutput !== clampedOutput && this.params.ki !== 0) {
-      // Actually, a simpler and equally valid anti-windup is conditional integration:
-      // only integrate if we are not saturated, OR if integrating helps us un-saturate 
-      // (error and saturated output have opposite signs).
-      // Here we implement conditional integration (clamping):
-      if ((rawOutput > this.params.outputMax && error > 0) || 
-          (rawOutput < this.params.outputMin && error < 0)) {
-        // Do not accumulate integral (windup limit)
-        // Keep integralTerm as it was before this step
-      } else {
-        this.integralTerm = iTermUnbounded;
-      }
-    } else {
-      this.integralTerm = iTermUnbounded;
-    }
-
-    // Recalculate output with the protected integral term to ensure consistency
+    // Step 6: final raw output with protected integral
     const finalRawOutput = pTerm + this.integralTerm + dTerm;
-    let finalOutput = finalRawOutput;
-    if (finalOutput > this.params.outputMax) finalOutput = this.params.outputMax;
-    if (finalOutput < this.params.outputMin) finalOutput = this.params.outputMin;
 
-    return finalOutput;
+    // Step 7: store for telemetry — must be AFTER windup protection (not before)
+    this.lastRawOutput = finalRawOutput;
+
+    // Step 8: clamp and return
+    if (finalRawOutput > outputMax) return outputMax;
+    if (finalRawOutput < outputMin) return outputMin;
+    return finalRawOutput;
   }
 
   /**
    * Live-updates PID gains without resetting integral or derivative state.
+   * Applied on the next call to update(). Supports live gain tuning from the UI.
    */
   setGains(kp: number, ki: number, kd: number): void {
     this.params.kp = kp;
@@ -139,7 +161,8 @@ export class PidController {
   }
 
   /**
-   * Resets the controller's internal state.
+   * Resets the controller's internal state (integral accumulator, derivative memory).
+   * Call on simulation reset — does NOT reset gains or output limits.
    */
   reset(): void {
     this.integralTerm = 0;
@@ -149,14 +172,18 @@ export class PidController {
   }
 
   /**
-   * Returns the last computed raw PID output before clamping [N·m].
+   * Returns the last computed raw output BEFORE clamping [N·m].
+   * This is the value after windup protection is applied but before the actuator
+   * limit clamps it. Positive values > outputMax indicate saturation. Used by
+   * telemetry to visualize controller saturation events in Phase 5.
    */
   getLastRawOutput(): number {
     return this.lastRawOutput;
   }
 
   /**
-   * Returns the current integral accumulator value.
+   * Returns the current integral accumulator value [N·m·s].
+   * Exposed for telemetry and debug — useful for diagnosing windup behavior.
    */
   getIntegralTerm(): number {
     return this.integralTerm;

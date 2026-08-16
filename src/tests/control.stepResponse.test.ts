@@ -6,8 +6,22 @@
  * Tests (PRD §6.7, Phase 3 deliverable):
  *   Using real physics engine (NOT mocked — R3.2), command a 45-degree step
  *   target angle. Assert that with a known-good default gain set:
- *     - The body settles within ±2 degrees of target within a defined settle time.
- *     - Overshoot does not exceed a defined percentage limit.
+ *     Test 1 — The body settles within ±2° of target within 30 s.
+ *     Test 2 — Overshoot does not exceed 20% of the step magnitude.
+ *
+ * Closed-loop wiring (matching Phase 4 SimulationLoop architecture):
+ *   physics → sensor → estimator → PID → motor (duty cycle) → torque → physics
+ *
+ * Motor between-tick protocol:
+ *   The PID controller and estimator run at the sensor rate (200 Hz).
+ *   Between sensor ticks the motor continues to receive the SAME duty cycle
+ *   that was last commanded — not a re-derived value from the returned torque.
+ *   This correctly models a real embedded system where the control interrupt fires
+ *   at the sensor rate and holds the PWM duty between interrupts.
+ *
+ * R3.2 — real physics engine used (integrate() called directly, not mocked).
+ * R3.3 — fixed sensor seed for deterministic results.
+ * R2.1 — pid.update() receives estimator output only, never trueState.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -37,105 +51,151 @@ import {
   DEFAULT_MOTOR_MAX_TORQUE_NM as OUTPUT_MAX,
 } from '../core/physics/constants.ts';
 
-const STEP_TARGET_RAD = Math.PI / 4; // 45°
-const TOLERANCE_RAD = (2 * Math.PI) / 180; // ±2°
+/** Target angle: 45° in radians [rad]. */
+const STEP_TARGET_RAD = Math.PI / 4;
 
-describe('Control — PID step response', () => {
-  it('settles within ±2° of 45° target within 30s with default gains, overshoot <= 20%', () => {
-    // Setup closed-loop components
-    const physicsParams = {
-      I1: DEFAULT_I1_WHEEL_KGM2,
-      I2: DEFAULT_I2_BODY_KGM2,
-      frictionCoeff1: DEFAULT_FRICTION_COEFF_1,
-      frictionCoeff2: DEFAULT_FRICTION_COEFF_2,
-    };
+/** Settle band: ±2° in radians [rad]. */
+const TOLERANCE_RAD = (2 * Math.PI) / 180;
 
-    const motor = new DefaultMotorModel({
-      maxRPM: DEFAULT_MOTOR_MAX_RPM,
-      maxTorqueNm: DEFAULT_MOTOR_MAX_TORQUE_NM,
-      timeConstantS: DEFAULT_MOTOR_TIME_CONSTANT_S,
-    }, physicsParams);
+/** Settle duration: body must stay inside the tolerance band for this long [s]. */
+const SETTLE_HOLD_SEC = 2.0;
 
-    const sensor = new DefaultSensorModel({
-      gyroNoiseSigma: DEFAULT_GYRO_NOISE_SIGMA_RAD_S,
-      accelAngleNoiseSigma: DEFAULT_ACCEL_ANGLE_NOISE_SIGMA_RAD,
-      gyroBiasDriftRate: DEFAULT_GYRO_BIAS_DRIFT_RATE,
-      sampleRateHz: DEFAULT_SENSOR_SAMPLE_RATE_HZ,
-      seed: 42,
-    });
+/** Maximum allowed overshoot fraction (20% of step magnitude). */
+const MAX_OVERSHOOT_FRACTION = 0.20;
 
-    const estimator = new ComplementaryFilter({ alpha: DEFAULT_COMPLEMENTARY_ALPHA });
+// ---------------------------------------------------------------------------
+// Shared closed-loop runner — runs the full loop for durationS seconds,
+// returns { settledTimeS, maxOvershootRad, finalTheta2 }.
+// Extracted so both it() blocks share identical physics wiring.
+// ---------------------------------------------------------------------------
 
-    const pid = new PidController({
-      kp: DEFAULT_KP,
-      ki: DEFAULT_KI,
-      kd: DEFAULT_KD,
-      outputMin: -OUTPUT_MAX,
-      outputMax: OUTPUT_MAX,
-    });
+interface RunResult {
+  /** First time [s] the body entered and held ±2° of target for ≥ SETTLE_HOLD_SEC. −1 if never. */
+  settledTimeS: number;
+  /** Maximum overshoot above the setpoint [rad]. 0 if body never exceeded setpoint. */
+  maxOvershootRad: number;
+  /** Body angle at end of run [rad]. */
+  finalTheta2: number;
+}
 
-    let state = createZeroState();
-    let maxOvershoot = 0;
-    let settledTimeS = -1;
-    
-    const dt = PHYSICS_DT_S;
-    const durationS = 30;
-    const steps = durationS / dt;
-    const sensorTicks = Math.round((1 / DEFAULT_SENSOR_SAMPLE_RATE_HZ) / dt);
+function runStepScenario(durationS: number, seed: number): RunResult {
+  const physicsParams = {
+    I1: DEFAULT_I1_WHEEL_KGM2,
+    I2: DEFAULT_I2_BODY_KGM2,
+    frictionCoeff1: DEFAULT_FRICTION_COEFF_1,
+    frictionCoeff2: DEFAULT_FRICTION_COEFF_2,
+  };
 
-    let lastControlTorque = 0;
+  const motor = new DefaultMotorModel({
+    maxRPM: DEFAULT_MOTOR_MAX_RPM,
+    maxTorqueNm: DEFAULT_MOTOR_MAX_TORQUE_NM,
+    timeConstantS: DEFAULT_MOTOR_TIME_CONSTANT_S,
+  }, physicsParams);
 
-    for (let i = 0; i < steps; i++) {
-      const t = i * dt;
+  const sensor = new DefaultSensorModel({
+    gyroNoiseSigma: DEFAULT_GYRO_NOISE_SIGMA_RAD_S,
+    accelAngleNoiseSigma: DEFAULT_ACCEL_ANGLE_NOISE_SIGMA_RAD,
+    gyroBiasDriftRate: DEFAULT_GYRO_BIAS_DRIFT_RATE,
+    sampleRateHz: DEFAULT_SENSOR_SAMPLE_RATE_HZ,
+    seed,
+  });
 
-      // 1. Sensor & Estimator update (runs at sensor rate)
-      const reading = sensor.sample(state, dt);
-      if (i % sensorTicks === 0) {
-        estimator.update(reading, 1 / DEFAULT_SENSOR_SAMPLE_RATE_HZ);
-        
-        // 2. Control update (using estimate)
-        // Convert N*m to duty cycle? The PRD/motorModel expects duty cycle [-1, 1],
-        // but PID output is Nm. Actually, PID output *is* the duty cycle or Nm?
-        // Wait, the PID output limit is OUTPUT_MAX (which is maxTorqueNm).
-        // If output is Nm, we can just pass output / maxTorqueNm as duty cycle.
-        // Invert the PID output: positive motor torque applies negative body torque.
-        // To move the body in the positive direction (positive error), we need negative motor torque.
-        const outputNm = pid.update(STEP_TARGET_RAD, estimator.getEstimate(), 1 / DEFAULT_SENSOR_SAMPLE_RATE_HZ);
-        const dutyCycle = -outputNm / OUTPUT_MAX;
-        
-        lastControlTorque = motor.update(dutyCycle, dt);
-      } else {
-        // Between sensor ticks, motor still updates
-        lastControlTorque = motor.update(lastControlTorque / OUTPUT_MAX, dt);
-      }
+  const estimator = new ComplementaryFilter({ alpha: DEFAULT_COMPLEMENTARY_ALPHA });
 
-      // 3. Physics step
-      state = integrate(state, lastControlTorque, 0, dt, physicsParams);
+  const pid = new PidController({
+    kp: DEFAULT_KP,
+    ki: DEFAULT_KI,
+    kd: DEFAULT_KD,
+    outputMin: -OUTPUT_MAX,
+    outputMax: OUTPUT_MAX,
+  });
 
-      // Analyze metrics
-      const error = state.theta2 - STEP_TARGET_RAD;
-      if (state.theta2 > STEP_TARGET_RAD) {
-        if (state.theta2 - STEP_TARGET_RAD > maxOvershoot) {
-          maxOvershoot = state.theta2 - STEP_TARGET_RAD;
-        }
-      }
+  let state = createZeroState();
 
-      if (Math.abs(error) <= TOLERANCE_RAD) {
-        if (settledTimeS === -1) settledTimeS = t;
-      } else {
-        settledTimeS = -1; // Reset if it goes out of bounds
-      }
+  const dt = PHYSICS_DT_S;                                        // 1 ms
+  const totalSteps = Math.round(durationS / dt);
+  const sensorDt = 1 / DEFAULT_SENSOR_SAMPLE_RATE_HZ;            // 5 ms
+  const stepsPerSensorTick = Math.round(sensorDt / dt);          // 5
+
+  // Duty cycle held between control ticks (correct protocol: hold PWM, not re-derive torque)
+  let heldDutyCycle = 0;
+
+  let maxOvershootRad = 0;
+  let settledTimeS = -1;
+  let continuousSettledSteps = 0;
+  const settleHoldSteps = Math.round(SETTLE_HOLD_SEC / dt);
+
+  for (let i = 0; i < totalSteps; i++) {
+    const t = i * dt;
+
+    // --- Sensor sample (every physics step; sensor model uses zero-order hold internally) ---
+    const reading = sensor.sample(state, dt);
+
+    // --- Control tick (at sensor rate only) ---
+    if (i % stepsPerSensorTick === 0) {
+      // Estimator update — only reads sensor, never trueState (R2.1)
+      estimator.update(reading, sensorDt);
+
+      // PID update — receives estimator output only, never trueState (R2.1)
+      // Positive error (body below target) → positive PID output → negative duty cycle
+      // (spinning wheel negatively applies positive body torque; see physics sign convention)
+      const pidOutputNm = pid.update(STEP_TARGET_RAD, estimator.getEstimate(), sensorDt);
+      heldDutyCycle = -pidOutputNm / OUTPUT_MAX;   // [−1, 1]
     }
 
-    // Must settle
-    expect(settledTimeS).toBeGreaterThanOrEqual(0);
-    expect(settledTimeS).toBeLessThan(30);
+    // --- Motor update — always called with the held duty cycle, every physics step ---
+    const actualTorqueNm = motor.update(heldDutyCycle, dt);
 
-    // Overshoot should be <= 20% of the step (20% of 45° is 9°)
-    const maxAllowedOvershoot = 0.2 * STEP_TARGET_RAD;
-    expect(maxOvershoot).toBeLessThanOrEqual(maxAllowedOvershoot);
-    
-    // Check final state is within tolerance
-    expect(Math.abs(state.theta2 - STEP_TARGET_RAD)).toBeLessThanOrEqual(TOLERANCE_RAD);
+    // --- Physics integration (RK4) ---
+    state = integrate(state, actualTorqueNm, 0, dt, physicsParams);
+
+    // --- Metrics ---
+    const overshoot = state.theta2 - STEP_TARGET_RAD;
+    if (overshoot > maxOvershootRad) maxOvershootRad = overshoot;
+
+    // Settle tracking: require SETTLE_HOLD_SEC of continuous in-band time
+    if (Math.abs(state.theta2 - STEP_TARGET_RAD) <= TOLERANCE_RAD) {
+      continuousSettledSteps++;
+      if (continuousSettledSteps >= settleHoldSteps && settledTimeS === -1) {
+        settledTimeS = t - SETTLE_HOLD_SEC; // report when it first entered the band
+      }
+    } else {
+      continuousSettledSteps = 0;
+      settledTimeS = -1; // band was exited; must re-settle
+    }
+  }
+
+  return { settledTimeS, maxOvershootRad, finalTheta2: state.theta2 };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('Control — PID step response', () => {
+  /**
+   * Test 1: Settle time.
+   * The body must enter and remain within ±2° of the 45° target for at least
+   * SETTLE_HOLD_SEC seconds, within a 30-second window.
+   * Failure here = controller too slow, or critically damped and can't reach setpoint.
+   */
+  it('settles within ±2° of 45° target and holds for ≥2 s, within 30 s (R3.2)', () => {
+    const { settledTimeS } = runStepScenario(30, /* seed */ 42);
+
+    expect(settledTimeS, 'Body never settled or exited the band permanently').toBeGreaterThanOrEqual(0);
+    expect(settledTimeS, 'Settled too late').toBeLessThan(30 - SETTLE_HOLD_SEC);
+  });
+
+  /**
+   * Test 2: Overshoot bound.
+   * Any overshoot above the 45° setpoint must be ≤ 20% of the step size (≤ 9°).
+   * Failure here = controller too aggressive / underdamped.
+   */
+  it('overshoot does not exceed 20% of step magnitude (≤9° for a 45° step) (R3.2)', () => {
+    const { maxOvershootRad } = runStepScenario(30, /* seed */ 42);
+
+    const maxAllowedRad = MAX_OVERSHOOT_FRACTION * STEP_TARGET_RAD; // 20% of π/4 ≈ 0.157 rad
+    expect(maxOvershootRad, `Overshoot ${(maxOvershootRad * 180 / Math.PI).toFixed(2)}° exceeds limit`)
+      .toBeLessThanOrEqual(maxAllowedRad);
   });
 });
