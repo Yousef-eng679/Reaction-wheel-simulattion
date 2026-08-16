@@ -1,0 +1,115 @@
+# .roles — standing constraints for all agent missions on this project
+
+Project: Reaction Wheel Attitude Control Simulator (software-only)
+Applies to: every task, mission, or prompt given to any agent (Gemini, Claude, or GPT-OSS)
+inside Google Antigravity for this repository, for the entire lifetime of the project.
+
+If any instruction in a task prompt conflicts with this file, this file wins. If an agent
+believes a rule here is blocking legitimate progress, it must stop and explain the conflict
+in its Artifact/summary rather than silently overriding the rule.
+
+---
+
+## 1. Physics integrity (non-negotiable)
+
+R1.1 — The relationship between wheel speed and body speed (ω2 as a function of ω1) must
+NEVER be computed by direct algebraic substitution of the steady-state conservation formula
+(e.g. `omega2 = -(I1/I2) * omega1`) applied every frame. It must always emerge from numerically
+integrating torque equations over time. Direct algebraic substitution is a forbidden shortcut:
+it produces a visually similar result in the simplest case but silently breaks disturbance
+response, friction modeling, and saturation behavior, and defeats the entire purpose of the
+simulation. Any agent output that does this must be rejected and rewritten.
+
+R1.2 — Physics integration must use RK4 (4th-order Runge-Kutta) or an equivalently accurate
+method. Plain forward Euler integration is forbidden for the core physics engine because it
+accumulates visible energy/momentum drift, which would misrepresent the conservation law this
+project exists to demonstrate.
+
+R1.3 — All internal physics and control computation must use SI units exclusively
+(kilograms, meters, radians, radians/second, newton-meters, seconds). Conversion to RPM,
+degrees, or other display units happens only at the UI display boundary — never inside
+`core/physics`, `core/control`, `core/actuator`, or `core/sensor`.
+
+R1.4 — Every physical constant (inertias, motor time constants, noise sigma, friction
+coefficients, etc.) must be a named, documented constant with a comment stating its unit and
+whether it is a "measured value" or a "representative placeholder pending real hardware
+characterization." No unnamed numeric literals in physics/control code.
+
+## 2. Architectural boundaries (non-negotiable)
+
+R2.1 — The controller (`core/control/pidController.ts`) must never receive ground-truth state
+directly. It only ever receives the sensor/estimator's output. Any code path that lets
+`trueState` reach the controller's `update()` call is a bug and must be fixed immediately,
+regardless of what phase of the plan is in progress.
+
+R2.2 — `core/control/pidController.ts` must have zero imports from any UI, rendering, or
+sim-orchestration module. It must remain framework-agnostic, pure, and directly portable to
+embedded C++ with minimal syntax translation. Do not introduce React state, DOM references,
+or async/Promise-based logic into this file.
+
+R2.3 — The UI layer (`src/ui/**`) may only call the public API of `SimulationLoop`. It must
+never import `physicsEngine.ts`, `pidController.ts`, `motorModel.ts`, `sensorModel.ts`, or
+`estimator.ts` directly. If the UI needs new data exposed, add a read-only getter to
+`SimulationLoop`'s public API — do not reach around it.
+
+R2.4 — The sensor model (`core/sensor/**`) must use a seedable pseudo-random number generator
+for all injected noise. Direct use of `Math.random()` anywhere in `core/sensor/` is forbidden,
+because it breaks deterministic, reproducible tests.
+
+R2.5 — Physics stepping must run on a fixed internal timestep via an accumulator pattern,
+fully decoupled from render framerate (`requestAnimationFrame` rate). Never derive the physics
+`dt` from the render loop's frame delta.
+
+## 3. Testing discipline
+
+R3.1 — No phase is complete until its stated automated tests exist and pass when run via
+`npm test`. A written summary claiming "this should work" without a passing test is not
+acceptable completion evidence.
+
+R3.2 — Tests for the closed-loop controller (Phase 3 onward) must exercise the real physics
+engine end-to-end, not a mocked or simplified stand-in, unless a test is explicitly and
+narrowly scoped to test the controller math in isolation (and is clearly named as such, e.g.
+`pidController.unit.test.ts`).
+
+R3.3 — Any test involving randomness (sensor noise) must run with a fixed seed so results are
+reproducible across runs and across machines.
+
+## 4. Scope discipline
+
+R4.1 — Each phase in `IMPLEMENTATION_PLAN.md` has an explicit file/folder scope. An agent
+mission must not modify files outside that scope without flagging it clearly in its summary
+and explaining why it was necessary.
+
+R4.2 — Do not implement Phase 7 (3D visualization) or any other stretch/optional item before
+all of Phase 0–6's acceptance criteria (PRD §9) are met and verified by the project owner.
+Gold-plating an optional feature while core integration is unverified is explicitly the wrong
+order of operations for this project.
+
+R4.3 — Do not add a backend, database, authentication, or any server-side component. This is
+a fully client-side, static, software-only simulation. If a task seems to require a backend,
+stop and flag it rather than adding one.
+
+R4.4 — Do not add dependencies beyond what's needed. No heavyweight charting/animation/state
+libraries for what a small hand-rolled canvas module or a single lightweight library can do.
+Justify any new dependency in the mission summary.
+
+## 5. Honesty about limitations
+
+R5.1 — Any default parameter value that is a placeholder (not yet measured from real
+hardware) must be labeled as such in code comments and in the README, per PRD §10. Do not
+present placeholder values as if they were validated measurements.
+
+R5.2 — If a requested feature genuinely cannot be done within the current architecture without
+violating R2.1–R2.3, the agent must say so explicitly and propose an architecture-preserving
+alternative, rather than quietly bending the boundary rules to satisfy the immediate request.
+
+## 6. Review gates
+
+R6.1 — Phases 1 and 4 (physics engine + full loop integration) are designated
+physics-integrity-critical. Agents should explicitly call out, in their summary, how the
+implementation satisfies R1.1 and R2.1 for these phases specifically, so the human reviewer
+can verify quickly without re-reading the entire diff line by line.
+
+R6.2 — Every mission's Artifact/summary must include: what was implemented, what was
+deliberately left out of scope, which tests were added/run and their results, and any
+deviation from this file or from `IMPLEMENTATION_PLAN.md` with justification.
